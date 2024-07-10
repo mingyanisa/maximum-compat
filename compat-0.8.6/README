@@ -1,0 +1,82 @@
+
+INSTALLATION
+
+To build the program, execute
+
+$ python setup.py build
+
+The program must then be installed.  Depending on how Python is installed,
+the following may be sufficient:
+
+$ python setup.py install
+
+A system-wide installation generally requires root access:
+
+$ sudo python setup.py install
+
+If you lack root access, or prefer not to affect your Python intallation,
+you can install under your home directory as follows:
+
+$ python setup.py install --home /your/home/directory
+
+Your PATH and PYTHONPATH environment variables must then respectively
+include the bin and lib/python directories under your home directory.
+
+
+USAGE
+
+The compat program takes a file in Phylip alignment format (non-interlaced)
+or fasta format as input.  It produces one or more output files containing
+phylogenetic trees, and writes various information to stderr.
+
+A simple example invocation, using provided sample input, is as follows:
+
+$ compat examples/PDS000002109.4.phy PDS000002109.4.tre
+
+This invocation will create PDS000001546.12.tre, which will contain
+a phylogenetic tree in Newick format.
+
+Input files that have been compressed using gzip can also be read:
+
+$ compat examples/PDS000002757.74.phy.gz PDS000002757.74.tre
+
+Input columns with very large numbers of ambiguities ('N' states) can
+slow down the algorithm.  These can be excluded from the analysis
+with the --max-ambig-frac option, e.g.:
+
+$ compat --max-ambig-frac 0.25 examples/PDS000002757.74.phy.gz PDS000002757.74.tre
+
+ignores columns with greater than 25% ambiguities.
+
+In the examples above, a single tree is produced.  When there is more than
+one maximum compatible set, this respresents a consensus.  In addition to this,
+a tree for each set may be obtained with the --separate-trees option:
+
+$ compat --separate-trees examples/PDS000002757.74.phy.gz PDS000002757.74.tre
+
+The output file then contains multiple trees: the consensus tree, followed
+by a separate tree for each maximum compatible set (in this case a total
+of five trees).
+
+Other options:
+
+    --incompat-pos file_name   Writes the positions (1-based indices) of
+                               sites that are not in all maximum compatible
+                               sets to file file_name, classified accoriding
+                               to whether they have >2 nucleotides or, if
+			       binary, are absent from all or merely some
+                               sets.
+
+    --upper-bounds method      Specify the method used by the maximum weight
+                               clique algorithm for finding upper bounds.
+                               This can affect the speed of the program.
+                               Normally this is chosen by the program, but
+                               it can be specified for the purpose of
+                               evaluation or perhaps to increase speed in
+                               some cases.  Choices for method are 'none',
+                               'coloring' (classic use of vertex coloring),
+                               or 'dp' (dynamic programming, a novel use
+                               of vertex coloring that sometimes provides
+                               a great speed advantage).
+
+                               

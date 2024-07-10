@@ -1,0 +1,1400 @@
+#!/usr/bin/env python
+#
+#   $Id: compat 5420 2024-06-23 22:43:08Z jcherry $
+#  ===========================================================================
+# 
+#                             PUBLIC DOMAIN NOTICE
+#                National Center for Biotechnology Information
+# 
+#   This software/database is a "United States Government Work" under the
+#   terms of the United States Copyright Act.  It was written as part of
+#   the author's official duties as a United States Government employee and
+#   thus cannot be copyrighted.  This software/database is freely available
+#   to the public for use. The National Library of Medicine and the U.S.
+#   Government have not placed any restriction on its use or reproduction.
+# 
+#   Although all reasonable efforts have been taken to ensure the accuracy
+#   and reliability of the software and data, the NLM and the U.S.
+#   Government do not and cannot warrant the performance or results that
+#   may be obtained by using this software or data. The NLM and the U.S.
+#   Government disclaim all warranties, express or implied, including
+#   warranties of performance, merchantability or fitness for any particular
+#   purpose.
+# 
+#   Please cite the author in any work or product based on this material.
+# 
+#  ===========================================================================
+# 
+#  Authors:  Joshua L. Cherry
+# 
+#  File Description: Maximum compatibility phylogeny reconstruction
+# 
+# 
+
+import compat
+import sys, gc, array
+import random
+
+def Print(s):
+    '''
+    Print to stderr
+    Works for both Python2 and 3
+    '''
+    sys.stderr.write(s)
+    sys.stderr.write('\n')
+    sys.stderr.flush()
+
+
+# Command-line argument parsing
+import getopt
+try:
+    optlist, args = getopt.getopt(sys.argv[1:], '',
+                                  ['exclude=',
+                                   'max-ambig-frac=',
+                                   'separate-trees',
+                                   'upper-bounds=',
+                                   'incompat-pos=',
+                                   'break'])
+
+    optdict = dict(optlist)
+    if len(args) not in [2, 3]:
+        raise getopt.GetoptError('wrong number of stand-alone args (%d)'
+                                 % len(args))
+    if '--upper-bounds' in optdict:
+        if optdict['--upper-bounds'] not in ['none', 'coloring', 'dp']:
+            raise getopt.GetoptError('--upper-bounds must be one of '
+                                     'none, coloring, or dp')
+        ub_method = optdict['--upper-bounds']
+    else:
+        ub_method = None  # Unspecified, not 'none'
+except getopt.GetoptError as e:
+    sys.stderr.write(e.msg)
+    sys.stderr.write('\n')
+    sys.stderr.write('Usage: %s [OPTIONS] aln_file output_tree_file '
+                     '[output_witness_tree_file]\n'
+                     % sys.argv[0])
+    sys.exit(1)
+
+
+if len(args) == 2:
+    fname, outfname = args
+    witness_fname = None
+else:
+    fname, outfname, witness_fname = args
+
+
+# Given a list or tuple, make a dictionary of counts of the keys
+def Counts(l):
+    rv = {}
+    for el in l:
+        if not el in rv:
+            rv[el] = 0
+        rv[el] += 1
+    return rv
+
+
+# Group things (into lists) according to the result of supplied function
+# (which becomes a dictionary key)
+def GroupBy(l, func):
+    d = {}
+    for el in l:
+        key = func(el)
+        if not key in d:
+            d[key] = []
+        d[key].append(el)
+    return d
+
+
+# CPU/elapsed time reporting
+
+_times = None
+def tic():
+    import os
+    global _times
+    _times = os.times()
+
+tt_messages = []
+def toc(msg=''):
+    import os
+    global _times
+    global tt_messages
+    new_times = os.times()
+    st = '%s  %s' % (' '.join(['%.3f' % (new_times[i] - _times[i])
+                               for i in [0, 1, 4]]),
+                     msg)
+    Print(st)
+    tt_messages.append(st)
+    _times = new_times
+
+def times():
+    for s in tt_messages:
+        Print(s)
+    import os
+    Print('')
+    t = os.times()
+    Print('%s  total for process' % (' '.join(['%.3f' % t[i]
+                                               for i in [0, 1, 4]])))
+
+
+# Functions for making a tree from sets (splits) with counts
+
+def ConsolidateCols(sets_disambig, indices, weights):
+    '''
+    Consolidate sets that are equal after disambiguation.
+    
+    This involves summing the weights for identical sets
+    '''
+    consol = {}
+    for i in indices:
+        if sets_disambig[i] not in consol:
+            consol[sets_disambig[i]] = 0
+        consol[sets_disambig[i]] += weights[i]
+
+    # If we have the set of everything but the first leaf, complement it
+    everything_else = frozenset(range(1, len(seqs)))
+    if everything_else in consol:
+        if frozenset([0]) not in consol:
+            consol[frozenset([0])] = 0
+        consol[frozenset([0])] += consol[everything_else]
+        del consol[everything_else]
+
+    sets_consol = consol.keys()
+    weights_consol = consol.values()
+    return consol
+
+def TreeFromCols(consol, nleaves):
+    gs = list(consol.items())
+
+    # Add leaf nodes that are missing due to lack of changes on terminal branch
+    for i in range(nleaves):
+        if not frozenset([i]) in consol:
+            gs.append( (frozenset([i]), 0) )
+
+    # Root node (set containing all)
+    gs.append((frozenset(range(nleaves)), 0))
+
+    gs.sort(key=lambda t: len(t[0]), reverse=True)
+
+    l = [(t[0], t[1], []) for t in gs]
+
+    leaves = l[-nleaves:]
+    inter  = l[:-nleaves]  # internal nodes
+    
+    # index leaves by their single set member
+    d = dict([(min(s[0]), s) for s in leaves])  
+
+    # First attach all leaves to their parents
+    for i in reversed(range(len(inter))):
+        for r in inter[i][0]:
+            if r in d:
+                inter[i][2].append(d[r])
+                del d[r]
+        if len(d) == 0:
+            break
+
+    # Now join internal nodes
+    for i in reversed(range(len(inter))):
+        for j in range(i+1, len(inter)):
+            if inter[j] == None:
+                continue
+            if inter[j][0].issubset(inter[i][0]):
+                inter[i][2].append(inter[j])
+                inter[j] = None
+
+    if inter.count(None) != len(inter) - 1:
+        raise RuntimeError('Problem building tree from final columns')
+
+
+    ##### Make order of children the same as with earlier algorithm #####
+
+    to_index = dict([(l[i][0], i ) for i in range(len(l))])
+    for x in l:
+        x[2].sort(key=lambda t: to_index[t[0]])
+
+    #####################################################################
+
+    for x in l:
+        sum_children = sum([len(y[0]) for y in x[2]])
+        if len(x[0]) == 1:
+            sum_children += 1
+        if sum_children != len(x[0]):
+            raise RuntimeError('Problem building tree from final columns:'
+                               ' inconsistent sizes')
+
+    return l
+
+
+# Read the alignment file
+
+def ReadAln(fname):
+    try:
+        import gzip
+        lines = gzip.open(fname, 'rt').readlines()
+    except:
+        lines = open(fname).readlines()
+
+    if lines[0][0] == '>':
+        # Assume it's a fasta format file
+        seq_lines = []
+        names = []
+        for line in lines:
+            if line.startswith('>'):
+                name = line[1:].split()[0]
+                names.append(name)
+                seq_lines.append([])
+            else:
+                seq_lines[-1].append(line.strip())
+        seqs = [''.join(l) for l in seq_lines]
+        return names, seqs
+
+    # Otherwise, assume it's a Phylip format file
+
+    header = lines[0]
+    lines = lines[1:]  # lose header
+    
+    try:
+        nseqs, ncols = header.split()
+        nseqs = int(nseqs)
+        ncols = int(ncols)
+    except ValueError as e:
+        Print('Problem parsing header line: %s' % e.message)
+        sys.exit(1)
+
+    lines = [l.split() for l in lines]
+
+    # Try to accomodate variations of file format.  Identifier may be
+    # separated from sequence by white space (and be any length),
+    # or fixed-field 10 characters (in which case there may be no
+    # white space).
+    seqs = []
+    names = []
+    for t in lines:
+        if len(t) == 2:
+            names.append(t[0])
+            seqs.append(t[1])
+        elif len(t) == 1:
+            s = t[0]
+            seqs.append(s[len(s) - ncols:])
+            names.append(s[:len(s) - ncols].strip())
+        else:
+            Print('Too many fields in line %d' % (lines.index(t) + 1))
+            sys.exit(1)
+    return names, [seq.upper() for seq in seqs]
+
+names, seqs = ReadAln(fname)
+
+seq_lens = [len(seq) for seq in seqs]
+if len(set(seq_lens)) != 1:
+    Print('Error: Rows in input not all the same length')
+    sys.exit(1)
+
+for i in range(len(seqs)):
+    bad_chars = set(seqs[i]).difference('AGCTN')
+    if len(bad_chars) != 0:
+        Print('Error: invalid character(s) in row %s: %s'
+              % (names[i], bad_chars))
+        sys.exit(1)
+
+if '--exclude' in optdict:
+    f = eval(optdict['--exclude'])
+    exclude = [f(name) for name in names]
+    sys.stderr.write('Excluding %d sequences\n' % sum(exclude))
+    names = [names[i] for i in range(len(names)) if not exclude[i]]
+    seqs  = [seqs[i]  for i in range(len(seqs))  if not exclude[i]]
+
+if '--max-ambig-frac' in optdict:
+    max_ambig_frac = float(optdict['--max-ambig-frac'])
+else:
+    max_ambig_frac = 1.0
+max_ambigs = int(len(seqs) * max_ambig_frac)
+
+nleaves = len(seqs)
+
+cols = compat.vector_vector_char()
+compat.Zip(seqs, cols)
+
+nucs = [frozenset(c) for c in cols]
+
+# Columns with exactly two bases, which are not ambiguous
+
+poss2 = [i for i in range(len(cols)) if len(nucs[i]) == 2
+         and not nucs[i].difference('AGCT')]
+cols2 = [cols[i] for i in poss2]
+
+sets2 = [frozenset(compat.PosNotOfChar(c, c[0])) for c in cols2]
+
+# Columns with two unambiguous bases and one or more Ns
+poss_ambig = [i for i in range(len(cols)) if len(nucs[i]) == 3
+              and 'N' in nucs[i] and not nucs[i].difference('AGCTN')]
+
+if max_ambigs < len(seqs):
+    over_ambig = set([i for i in poss_ambig
+                      if cols[i].count('N') > max_ambigs])
+    poss_ambig = [i for i in poss_ambig if i not in over_ambig]
+else:
+    over_ambig = []
+
+cols_ambig = [cols[i] for i in poss_ambig]
+
+def RepAmbig(c):
+    ch_other = compat.SecondNotN(c)
+    return (frozenset(compat.PosOfChar(c, ch_other)),
+            frozenset(compat.PosOfChar(c, 'N')))
+
+sets_ambig = [RepAmbig(c) for c in cols_ambig]
+
+sets_all = sets2 + sets_ambig
+poss = poss2 + poss_ambig  # maps index into sets_all to original aln. position
+
+counts = Counts(sets_all)
+
+# Ordering here affects speed for some cases; not clear what is optimal
+patterns = list(counts.keys())
+ambig_patterns = [s for s in patterns if type(s) == tuple]
+ambig_patterns.sort(key=lambda s: len(s[1]))
+patterns = [s for s in patterns if type(s) != tuple] + ambig_patterns
+weights = [counts[pat] for pat in patterns]
+groups = GroupBy(range(len(sets_all)), lambda i: sets_all[i])
+groups = [groups[pat] for pat in patterns]              # indices into sets_all
+poss_for_pat = [[poss[i] for i in g] for g in groups]   # indices into whole aln
+
+Print('%d ambiguous states' % sum([s.count('N') for s in seqs]))
+Print('%d binary cols, %d with ambiguities' % (len(sets_all),
+                                               len(sets_ambig)))
+Print('%d ambiguous states in binary columns'
+      % sum([len(s[1]) for s in sets_ambig]))
+
+
+def ToSets(t):
+    return (frozenset(t[0]), frozenset(t[1]))
+
+
+sets_union = []
+for s in patterns:
+    if type(s) == tuple:
+        sets_union.append( (s[0], s[0].union(s[1])) )
+    else:
+        sets_union.append(s)
+
+sets = []
+for s in sets_union:
+    if type(s) != tuple:
+        s = (s, s)
+    s = (tuple(s[0]), tuple(s[1]))
+    sets.append(s)
+
+
+def Complement(s, universal_set_size):
+    '''
+    Returns the complement of the set,
+    assuming universal set is 0..universal_set_size - 1
+    
+    Maintains sets as sets, tuples as tuples, etc.
+    '''
+    
+    if type(s) == set or type(s) == frozenset:
+        universal_set = type(s)(range(0, universal_set_size))
+        return universal_set.difference(s)
+    else:
+        s_set = frozenset(s)
+        rv = [i for i in range(0, universal_set_size) if i not in s_set]
+        if type(s) != list:
+            rv = type(s)(rv)
+        return rv
+
+
+def TotalWeight(nodes, weights):
+    return sum([weights[i] for i in nodes])
+
+
+def Mean(l):
+    return sum(l) / float(len(l))
+
+
+# If a vertex has weight greater than combined weights of its conflicts,
+# that vertex must be in any MWC, and its conflicts must be absent.
+# This fact can be used to decrease the size of the MWC problem.
+
+def DominantWeightReduceOne(nodes, conflicts, weights):
+    '''
+    Single round of reduction
+    '''
+    conf_weight = [sum([weights[i] for i in conflicts[j].intersection(nodes)])
+                   for j in nodes]
+    dominant_nodes = [nodes[i] for i in range(len(nodes))
+                      if conf_weight[i] < weights[nodes[i]]]
+    to_remove = set()
+    for n in dominant_nodes:
+        to_remove.update(conflicts[n])
+    reduced = [i for i in nodes
+               if i not in to_remove and i not in dominant_nodes]
+    return dominant_nodes, reduced
+
+
+def DominantWeightReduce(nodes, conn, weights):
+    '''
+    Continue reduction until no further elimination possible
+    '''
+    conflicts = {}
+    for n in nodes:
+        vec = tuple(conn[n])
+        conflicts[n] = set([n2 for n2 in nodes if vec[n2] == '\x00'])
+    dominant_nodes = []
+    reduced = nodes
+    while True:
+        old_len = len(reduced)
+        new_dominant_nodes, reduced = DominantWeightReduceOne(reduced,
+                                                              conflicts,
+                                                              weights)
+        dominant_nodes += new_dominant_nodes
+        if len(reduced) == old_len:
+            return dominant_nodes, reduced
+
+
+# If a vertex has weight greater than max weight clique of its conflicts,
+# that vertex must be in any MWC, and its conflicts must be absent.
+
+def HasCliqueOfWeight(nodes, weights, conn, min_weight):
+    cl = compat.MaxClique()
+    cl.SetReportMaxes(False)
+    cl.SetReportProgress(False)
+    return cl.HasCliqueOfWeight(nodes, weights, conn, min_weight)
+
+
+def MaxConfClique(nodes, weights, conn, maxes):
+    xconn = [[ord(x) for x in c] for c in conn]  # speeds some of below
+    reduced = nodes
+    for mx in maxes:
+        confs = dict([(i, [j for j in reduced if not xconn[i][j]])
+                      for i in reduced])
+
+        dominant = [i for i in confs
+                    if len(confs[i]) <= mx
+                    and weights[i] > 1
+                    and max([weights[j] for j in confs[i]] + [0]) < weights[i]
+                    and not HasCliqueOfWeight(confs[i], weights,
+                                              conn , weights[i])]
+
+        dominated = set(sum([confs[i] for i in dominant], []))
+        reduced = [i for i in reduced if i not in dominated]
+    return reduced
+
+
+## Witness tree; some way of completely resolving ambiguous bases
+## s.t. the cols in the clique are all compatible.
+
+def ForceSingletons(sets, nleaves):
+    '''
+    For every ambiguous set that could be a singleton,
+    make it a singleton
+    '''
+
+    witness_sets = list(sets)
+
+    # For all those that could be a singleton, take the singleton,
+    # since it's compatible with everything.
+    possible_singleton = [i for i in range(len(witness_sets))
+                          if not isinstance(witness_sets[i], frozenset)
+                          and (len(witness_sets[i][0]) == 1
+                          or len(witness_sets[i][1]) == nleaves - 1)]  # comp of singleton
+
+    for i in possible_singleton:
+        if len(witness_sets[i][0]) == 1:
+            witness_sets[i] = witness_sets[i][0]
+        else:
+            # it's the complement of a singleton
+            absent, = [n for n in range(nleaves) if n not in witness_sets[i][1]]
+            witness_sets[i] = frozenset([absent])
+
+    # modified list of sets and list of modified
+    return witness_sets, possible_singleton  
+
+
+def ForceToExistingUnambiguous(sets):
+    '''
+    Where range includes an unambiguous pattern that is
+    in our set, set this one equal to that unambiguous one, 
+    since that cannot introduce new conflicts.
+
+    N.B.: Does not consider unambiguous singletons,
+    since that would be redundant with ForceSingletons()
+    '''
+    modified = []
+    witness_sets = list(sets)
+    unamb_non_sing = set([x for x in witness_sets
+                          if isinstance(x, frozenset) and len(x) != 1])
+    by_size = GroupBy(unamb_non_sing, lambda s: len(s))
+    for i in range(len(sets)):
+        if (isinstance(witness_sets[i], tuple)
+            and len(witness_sets[i][0]) != len(witness_sets[i][1])):  # ambiguous
+            for s in sum((by_size.get(n, []) for n in range(len(witness_sets[i][0]), len(witness_sets[i][1]) + 1)), []):
+                if (s.issubset(witness_sets[i][1])
+                    and s.issuperset(witness_sets[i][0])):
+                    witness_sets[i] = s
+                    modified.append(i)
+                    break
+
+    return witness_sets, modified  # witness sets and indices of sets modified
+
+
+_to_sorted_tuples_cache = {}
+def ToSortedTuples(s):
+    if s in _to_sorted_tuples_cache:
+        return _to_sorted_tuples_cache[s]
+    if not isinstance(s, tuple) or len(s) != 2 or isinstance(s[0], int):
+        rv = 2*(tuple(sorted(s)),)
+    else:
+        rv = (tuple(sorted(s[0])),
+              tuple(sorted(s[1]))
+              )
+    _to_sorted_tuples_cache[s] = rv
+    return rv
+
+
+# Some sets cannot be inconsis with any ambiguous ones;
+# no need to disambiguate against
+
+def CannotConflict(s1, s2):
+    '''
+    Identifies some, but not all, situations where
+    two sets cannot possibly conflict upon any disambiguation.
+    Is false for any ambiguous set compared to itself.
+    
+    Requires arguments to be in "two sets" form.
+    '''
+    return (s1[1].isdisjoint(s2[1])
+            or s1[0].issuperset(s2[1])
+            or s1[1].issubset(s2[0])
+            )
+
+
+####### Forceful disambiguation #########
+
+def ForceDisambiguation(sets, nleaves):
+    '''
+    Modifies sets in place
+    '''
+    nodes = list(range(len(sets)))
+    the_sets = []
+    for x in sets:
+        if isinstance(x, frozenset):
+            x = (x, x)
+        the_sets.append(ToSortedTuples(x))
+
+    ambig = [i for i in nodes if len(the_sets[i][1]) != len(the_sets[i][0])]
+    sambig = set(ambig)
+    nodes_reorder = [i for i in nodes if i not in sambig] + ambig
+    # discard unambiguous singletons
+    nodes_reorder = [i for i in nodes_reorder if len(the_sets[i][1]) != 1]
+
+    # Uniquify unambiguous sets for speed
+    gr = GroupBy([i for i in nodes if len(the_sets[i][1]) != 1],
+                 lambda i: sets[i])
+    index_map = {}
+    for l in gr.values():
+        for i in l:
+            index_map[i] = l
+    uniq = set([l[0] for l in gr.values()])
+
+    indices = [i for i in nodes if i in uniq and len(the_sets[i][1]) != 1]
+    always_consis = compat.CannotConflict([the_sets[i] for i in indices],
+                                          nleaves)
+    always_consis = [indices[i] for i in always_consis]
+    always_consis = frozenset(always_consis)
+
+    nodes_reorder = [i for i in nodes_reorder
+                      if i in uniq and i not in always_consis]
+    nodes_reorder.reverse()  # uniquified not always consis sets now first
+    
+    dis = [the_sets[x] for x in nodes_reorder]  # The sets to be processed
+
+    try:
+        dis = compat.ForceDisambiguation(dis, nleaves)
+    except compat.CInconsisExcept as e:
+        # Adjust indices in exception to correspond to list in argument
+        e.SetIdx1(nodes_reorder[e.GetIdx1()])
+        e.SetIdx2(nodes_reorder[e.GetIdx2()])
+        raise e
+        
+    for i in range(len(nodes_reorder)):
+        idx = nodes_reorder[i]
+        if idx in sambig:
+            for j in index_map[idx]:
+                the_sets[j] = dis[i]
+
+    for i in ambig:
+        assert(len(the_sets[i][0]) == len(the_sets[i][1]))
+        sets[i] = frozenset(the_sets[i][0])
+
+    return ambig  # those we modified
+
+
+_one_or_two_sets_cache = {}
+def ToOneOrTwoSets(s):
+    if s in _one_or_two_sets_cache:
+        return _one_or_two_sets_cache[s]
+    if len(s[0]) == len(s[1]):
+        rv = frozenset(s[0])
+    else:
+        rv = (frozenset(s[0]), frozenset(s[1]))
+    _one_or_two_sets_cache[s] = rv
+    return rv
+
+
+def MakeWitness(sets, nleaves, additional_unambig=[]):
+    witness_sets, set_singletons = \
+        ForceSingletons([ToOneOrTwoSets(s) for s in sets], nleaves)
+    full = witness_sets + [ToOneOrTwoSets(s) for s in additional_unambig]
+    witness_sets, set_unambig = ForceToExistingUnambiguous(full)
+    witness_sets = witness_sets[:len(sets)]
+    try:
+        forced = ForceDisambiguation(witness_sets, nleaves)
+    except compat.CInconsisExcept as e:
+        Print('Failed to make witness')
+        raise e
+    return witness_sets, set_singletons, set_unambig, forced
+
+
+def DPFromColoring(nodes, colors, pconn, weights):
+    '''
+    Given a vertex coloring and other information,
+    create a structure that can be used to calculate
+    upper bounds using dynamic programming.
+    '''
+    clrs = GroupBy(nodes, lambda i: colors[i])
+    for k in clrs.keys():
+        clrs[k].sort(key=lambda i: -weights[i])
+    pool = list(sorted(clrs))
+    chosen = [pool[0]]
+    children = [[]]
+    dummy = pool.pop(0)
+    i = 0
+    while True:
+        if i >= len(chosen):
+            # Add first in list
+            children[0].append(pool[0])
+            chosen.append(pool[0])
+            children.append([])
+            dummy = pool.pop(0)
+        # Find those that conflict
+        largest = clrs[chosen[i]][0]
+        c = [j for j in pool if not pconn[largest][clrs[j][0]]]
+        # Add them to children, remove from pool, add to chosen
+        children[i].extend(c)
+        pool = [j for j in pool if j not in c]
+        chosen.extend(c)
+        children.extend([[] for j in range(len(c))])
+        if len(pool) == 0:
+            break
+        i += 1
+
+    dp_els = [compat.SDynProgEl(clrs[i]) for i in sorted(clrs)]
+    for i in chosen:
+        for ch in children[i]:
+            dp_els[chosen[i]].children.push_back(dp_els[ch])
+    dp = compat.SDynProg()
+    dp.root = dp_els[0]
+    dp.max_node = max(nodes)
+
+    return dp, dp_els
+
+
+#########################################
+
+def ProblemEls(conf1, conf2, orig1, orig2, nleaves):
+    '''
+    Where partial disambiguation has led to incompatibility,
+    find which ambiguous elements are responsible.
+
+    conf1 is a restriction of orig1 or its complement
+    conf2 is a restriction of orig2 or its complement
+    orig1 compatible with orig2
+    conf1 incompatible with conf2
+    '''
+
+    els = set()
+
+    # Easier to work with set type
+    conf1 = ToSets(conf1); conf2 = ToSets(conf2)
+    orig1 = ToSets(orig1); orig2 = ToSets(orig2)
+
+    # Sets may have been complemented,
+    # in which case we need to complement again to restore
+    if not (conf1[0].issuperset(orig1[0]) and
+            conf1[1].issubset(orig1[1])):
+        Print('Complementing conflicting set 1')
+        conf1 = (Complement(conf1[1], len(seqs)),
+                 Complement(conf1[0], len(seqs)))
+        if not (conf1[0].issuperset(orig1[0]) and
+                conf1[1].issubset(orig1[1])):
+            raise RuntimeError('conflicting set 1 not a restriction '
+                               'of original set')
+    if not (conf2[0].issuperset(orig2[0]) and
+            conf2[1].issubset(orig2[1])):
+        Print('Complementing conflicting set 2')
+        conf2 = (Complement(conf2[1], len(seqs)),
+                 Complement(conf2[0], len(seqs)))
+        if not (conf2[0].issuperset(orig2[0]) and
+                conf2[1].issubset(orig2[1])):
+            raise RuntimeError('conflicting set 2 not a restriction '
+                               'of original set')
+
+    if orig1[0].issubset(orig2[1]):
+        els.update(conf1[0].difference(conf2[1]))
+    if orig2[0].issubset(orig1[1]):
+        els.update(conf2[0].difference(conf1[1]))
+    if orig1[0].isdisjoint(orig2[0]):
+        els.update(conf1[0].intersection(conf2[0]))
+    if (len(orig1[1]) + len(orig2[1]) >= nleaves and
+        len(orig1[1].union(orig2[1])) == nleaves):
+        universal = orig1[1].union(orig2[1])
+        els.update(universal.difference(conf1[1].union(conf2[1])))
+
+    # Elements in els may by unambiguous in one of the
+    # original sets, and hence irrelevant for that set.
+    # Find the relevant ones for each set.
+
+    ambig1 = orig1[1].difference(orig1[0])
+    ambig2 = orig2[1].difference(orig2[0])
+
+    return els.intersection(ambig1), els.intersection(ambig2)
+
+
+# An "enum" indicating outcome of ProcessCandidate
+e_Success = 0
+e_FailedDisambig = 1
+e_FailedWitness = 2
+
+def ProcessCandidate(clique, sets, orig_sets,
+                     not_yet_disambig, nleaves,
+                     find_multiple_conflicts=True,
+                     partial_groups=None,
+                     cannot_conflict=frozenset()):
+    '''
+    For candidate solution, attempt to pairwise disambiguate and make witness.
+    Return these if successful.
+    Otherwise, return information about conflicts that arose.
+
+    Function has some non-obvious and inconvenient features designed
+    to support efficiency:
+
+    For efficiency the caller may pass a set that is already partially
+    disambiguated.  However, the original sets are also needed when
+    dealing with conflicts (to determine which bits have changed
+    from original).  This is an additional parameter (orig_sets).
+
+    Disambiguation can be faster if we know which members are
+    outside of the already disambiguated set.  These are
+    passed as an additional parameter (not_yet_disambig).
+    '''
+
+    # Uniquify sets for speed
+    if partial_groups is not None:
+        gr = dict(partial_groups)
+        for i in not_yet_disambig:
+            s = sets[i]
+            if s not in gr:
+                gr[s] = []
+            gr[s].append(i)
+    else:
+        gr = GroupBy(clique, lambda i: sets[i])
+    index_map = {}
+    for l in gr.values():
+        for i in l:
+            index_map[i] = l
+    uniq = set([l[0] for l in gr.values()])
+
+    # Disambiguate
+
+    # Reverse order for speed, then reverse result to restore order
+    problem_pairs = []
+    problem_indices = set()
+    rclique = list(reversed(clique))
+
+    tried_witness = False
+
+    to_expand = {}
+    while True:  # Keep trying, progressively removing columns, until successful
+        try:
+            to_disambig = [i for i in rclique
+                           if i in uniq and i not in problem_indices
+                           and i not in cannot_conflict]
+            to_process = [i for i in range(len(to_disambig))
+                          if to_disambig[i] in not_yet_disambig]
+
+            disambig = tuple(reversed(
+                    compat.Disambiguate([sets[i]
+                                         for i in to_disambig],
+                                        nleaves,
+                                        to_process
+                                        )))
+
+            if len(problem_indices) == 0:
+                tried_witness = True
+                tmp = list(sets)
+                disambig = list(reversed(disambig))
+                for i in range(len(to_disambig)):
+                    for j in index_map[to_disambig[i]]:
+                        tmp[j] = disambig[i]
+                disambig = tmp
+
+                witness_sets, set_singletons, set_unambig, forced = \
+                    MakeWitness([disambig[i] for i in to_disambig], len(seqs),
+                                [disambig[i]
+                                 for i in uniq.intersection(cannot_conflict)
+                                 if len(disambig[i][1]) != 1])
+
+                tmp = list(sets)
+                for i in range(len(to_disambig)):
+                    for j in index_map[to_disambig[i]]:
+                        tmp[j] = witness_sets[i]
+                for i in cannot_conflict:
+                    tmp[i] = frozenset(tmp[i][0])
+                witness_sets = [tmp[i] for i in clique]
+                for i in range(len(witness_sets)):
+                    if isinstance(witness_sets[i], tuple):
+                        witness_sets[i] = ToOneOrTwoSets(witness_sets[i])
+                set_singletons = sum([index_map[to_disambig[i]]
+                                      for i in set_singletons], [])
+                set_unambig = sum([index_map[to_disambig[i]]
+                                   for i in set_unambig], [])
+                forced = sum([index_map[to_disambig[i]] for i in forced], [])
+
+            break  # On success, break out of the loop
+
+        except compat.CInconsisExcept as e:
+            idx1, idx2 = to_disambig[e.GetIdx1()], to_disambig[e.GetIdx2()]
+            conf1 = e.GetArg1(); conf2 = e.GetArg2()  # Sets that conflicted
+            Print('Removing pair %d, %d' % (idx1, idx2))
+            problem_pairs.append((idx1, idx2))
+            problem_indices.update([idx1, idx2])
+            
+            to_expand1, to_expand2 = ProblemEls(conf1, conf2,
+                                                orig_sets[idx1],
+                                                orig_sets[idx2],
+                                                len(seqs))
+
+            if len(to_expand1) > 0:
+                if not idx1 in to_expand:
+                    to_expand[idx1] = set()
+                to_expand[idx1].update(to_expand1)
+            if len(to_expand2) > 0:
+                if not idx2 in to_expand:
+                    to_expand[idx2] = set()
+                to_expand[idx2].update(to_expand2)
+            if len(to_expand1) == 0 and len(to_expand2) == 0:
+                raise RuntimeError('problem subsetting')
+            if not find_multiple_conflicts:
+                # Found one, so we're done
+                break
+
+    if len(problem_pairs) == 0:  # No conflicts when disambiguating; we're done
+        return (e_Success,
+                [disambig[i] for i in clique],
+                (witness_sets, set_singletons, set_unambig, forced)
+                )
+
+    Print('Problem pairs: %s' % problem_pairs)
+    if tried_witness:
+        status = e_FailedWitness
+    else:
+        status = e_FailedDisambig
+
+    return status, to_expand
+
+
+###############################################################
+#                         LOOP
+###############################################################
+
+weights_exp = list(weights)            # May grow due to set expansion
+orig_set_idx = list(range(len(sets)))  # So "extra" sets map back.
+sets_expanded = list(sets)
+
+special_pairs = []
+to_expand = {}
+
+while True:  # until our pairwise compatible set is mutually compatible
+
+    # For specified ambiguous sets, separately represent all 2^n subsets
+    # resulting from disambiguating the specified n elements.
+    # Will later mark these as incompatible with each other.
+    for idx in to_expand:
+        els_to_dis = to_expand[idx]
+        remaining_ambig = (set(sets_expanded[idx][1])
+                           .difference(sets_expanded[idx][0])
+                           .difference(els_to_dis))
+        # Generate all 2^n combinations
+        combs = [()]
+        for el in els_to_dis:
+            tmp = [x + (el,) for x in combs]
+            combs += tmp
+        lower_sets = [set(sets_expanded[idx][0]).union(x) for x in combs]
+        ambig_sets = [(tuple(x), tuple(x.union(remaining_ambig)))
+                      for x in lower_sets]
+        # 
+        sets_expanded[idx] = ambig_sets[0]
+        sets_expanded += ambig_sets[1:]
+        weights_exp += (len(ambig_sets) - 1) * [weights_exp[idx]]
+        orig_set_idx += (len(ambig_sets) - 1) * [orig_set_idx[idx]]
+        
+    res_conf = compat.vector_vector_unsigned_int()
+    compat.Conflicts(sets_expanded, len(seqs), res_conf)
+
+    # Put in additional conflicts for expansion products of the same set
+
+    idx_map = GroupBy([i for i in range(len(orig_set_idx))],
+                      lambda x: orig_set_idx[x])
+
+    for l in idx_map.values():
+        if len(l) > 1:
+            compat.AddConflicts(res_conf, l)
+            for i in l:
+                res_conf[i] = [j for j in res_conf[i] if j != i]
+
+
+    ############################################
+
+    included = []                                 # These are indices into
+    candidates = list(range(len(sets_expanded)))  # sets_expanded
+    while True:
+        new_included = compat.vector_unsigned_int()
+        candidate_groups = compat.vector_vector_unsigned_int()
+        group_weights = compat.vector_unsigned_int()
+        conn = compat.vector_vector_char()
+        ranges = compat.vector_unsigned_int()
+        min_weight = compat.Preprocess(candidates,
+                                       weights_exp, res_conf,
+                                       new_included, candidate_groups,
+                                       group_weights, conn, ranges)
+        included += list(new_included)
+    
+        Print('%d candidate categories' % len(candidate_groups))
+        Print('%d candidates' % sum([len(c) for c in candidate_groups]))
+        Print('minimum size %d' % min_weight)
+
+        if len(candidate_groups) == 0:
+            # This can happen when Preprocess completely determines the MWC
+            reduced = []
+            reduced_min_weight = 0
+            break
+
+        colors = compat.Color2(conn, group_weights)
+        reduced = compat.ColorReduce(range(len(candidate_groups)),
+                                                colors, group_weights,
+                                                conn, min_weight)
+        dominant_nodes, reduced = \
+            DominantWeightReduce(reduced, conn, group_weights)
+        dom_weight = sum([group_weights[i] for i in dominant_nodes])
+        reduced_min_weight = max(min_weight - dom_weight, 0)
+        included += list(sum([candidate_groups[i] for i in dominant_nodes], ()))
+        if len(reduced) == len(conn) and len(reduced) > 100:
+            # Employ more aggressive reduction
+            Print('Running MaxConfClique')
+            r = MaxConfClique(reduced, group_weights, conn,
+                              [100, 100, 1000, 100])
+            reduced = r
+        candidates = sum([candidate_groups[i] for i in reduced], ())
+        if len(reduced) == len(conn) or len(candidates) == 0:
+            break
+
+    Print('Reduced set: %d categories, minimum size %d' % 
+          (len(reduced), reduced_min_weight))
+
+    # Check that "greedy" clique disambiguates without conflict
+    if len(ranges):
+        greedy_start = list(ranges).index(max(ranges))
+    else:
+        greedy_start = 0
+    Print('Greedy clique starts at %d' % greedy_start)
+    greedy = (list(included) +
+              list(sum([candidate_groups[i] for i in reduced
+                        if i >= greedy_start], ())))
+
+    try:
+        gdisambig = tuple(reversed(
+               compat.Disambiguate([sets_expanded[i]
+                                    for i in reversed(greedy)],
+                                   len(seqs))))
+
+        cl = compat.MaxClique()
+
+        if ((len(reduced) > 50 and ub_method == None)
+            or ub_method in ['coloring', 'dp']):
+            colorings = [compat.Color2(range(i, len(conn)),
+                                       conn, group_weights)
+                         for i in range(len(conn))]
+            cl.SetColorings(colorings)
+            if ((len(reduced) < 200 and ub_method == None)
+                or ub_method == 'coloring'):
+                # Use vertex coloring
+                cl.SetUpperBoundType(cl.e_Coloring)
+            else:
+                # Use dynamic programming.  Need to build structures.
+                pconn = [[x == '\x01' for x in c] for c in conn]
+                pgroup_weights = list(group_weights)
+                dps = [DPFromColoring(range(i, len(conn)),
+                                      colorings[i], pconn, pgroup_weights)
+                       for i in range(len(conn))]
+                vec = compat.vector_SDynProg([t[0] for t in dps])
+                cl.SetDynProgs(vec)
+                cl.SetUpperBoundType(cl.e_Dyn_prog)
+
+        if '--break' in optdict:
+            # This is a convenience for development
+            import os
+            if 'PYTHONSTARTUP' in os.environ:
+                execfile(os.environ['PYTHONSTARTUP'])
+            raise RuntimeError()
+
+        ress = cl.FindAll(reduced, group_weights, conn,
+                          ranges, reduced_min_weight)
+
+    except compat.CInconsisExcept as e:
+        # use "greedy" clique for marking problem sets/pairs/bits
+        Print('Greedy clique inconsistent')
+        gdisambig = None
+        ress = [tuple(i for i in reduced if i >= greedy_start)]
+
+    
+    # For speed, disambiguate intersection of all solutions once,
+    # and use results for all solutions
+    if gdisambig != None:  # otherwise, may fail
+        inter = set(ress[0])
+        for res in ress[1:]:
+            inter.intersection_update(res)
+        common = included + sum([list(candidate_groups[i])
+                                 for i in ress[0] if i in inter], [])
+        try:
+            common_disambig = tuple(reversed(
+                    compat.Disambiguate([sets_expanded[i]
+                                         for i in reversed(common)],
+                                        len(seqs))))
+            tmp = list(sets_expanded)
+            for i in range(len(common)):
+                tmp[common[i]] = common_disambig[i]
+            partially_disambig = tmp
+
+        except compat.CInconsisExcept as e:
+            Print('Intersection of solutions is incompatible')
+            # Treat the intersection as the (sole) solution
+            ress = [tuple(i for i in ress[0] if i in inter)]
+            partially_disambig = None
+            inter = []
+    else:
+        partially_disambig = None
+        inter = []
+        common = included
+    results = []
+    any_success = False
+
+    # For speed of later disambiguations,
+    # disambiguate each not in common against common
+    not_common = sum([candidate_groups[i] for i in set(sum(ress, ()))
+                      if i not in inter], ())
+    if partially_disambig is not None:
+        for i in not_common:
+            try:
+                tmp = compat.Disambiguate(tuple([sets_expanded[i]])
+                                          + common_disambig,
+                                          len(seqs), [0])
+                partially_disambig[i] = tmp[0]
+            except compat.CInconsisExcept:
+                pass  # incomatibility will be handled below
+
+    if partially_disambig is not None:
+        # Do much of grouping just once
+        partial_groups = GroupBy(common, lambda i: partially_disambig[i])
+        # Find unambiguous that need not be processed because
+        # they cannot conflict with anything in any maximum clique
+        indices_all = common + list(not_common)
+        cc = compat.CannotConflict([partially_disambig[i] for i in indices_all], len(seqs))
+        cc = [indices_all[i] for i in cc]
+        cc = set(i for i in cc if i not in not_common)
+
+    gc.disable()
+    uniquifier = {}  # For memory conservation trick
+    for res in ress:
+        additional = sum([list(candidate_groups[i]) for i in res
+                          if i not in inter], [])
+        clique = common + additional
+
+        Print('Clique size %d; Total weight of clique: %d'
+              % (len(clique),
+                 sum([weights_exp[i] for i in clique])))
+
+        if len(clique) > 0 and partially_disambig != None:
+            tmp = ProcessCandidate(clique, partially_disambig,
+                                   sets_expanded, additional, len(seqs),
+                                   not any_success,
+                                   partial_groups,
+                                   cc)
+        else:
+            tmp = ProcessCandidate(clique, sets_expanded,
+                                   sets_expanded, clique, len(seqs),
+                                   not any_success)
+        
+        # Memory conservation trick.
+        # Results of ProcessCandidate() for different maximum cliques contain
+        # many components that are equal in value but distinct objects.
+        # Assure that just one copy persists.
+        if len(tmp) == 3:  # successful disambiguation and witness set
+            for i, x in enumerate(tmp[2][0]):
+                if x not in uniquifier:
+                    uniquifier[x] = x
+                else:
+                    tmp[2][0][i] = uniquifier[x]
+            for i, x in enumerate(tmp[1]):
+                if x not in uniquifier:
+                    uniquifier[x] = x
+                else:
+                    tmp[1][i] = uniquifier[x]
+
+        results.append(tmp + (array.array('L', clique),))
+
+        if tmp[0] == e_Success:
+            any_success = True
+    
+    if (any([t[0] == e_Success for t in results])
+        and not any([t[0] == e_FailedWitness for t in results])):
+        # At least one candidate good, and all others are bad
+        break  
+    
+    # Otherwise, need to do some ambiguity expansion and try again
+    to_expand = {}
+    for i in range(len(ress)):
+        result = results[i]
+        if result[0] != e_Success:
+            problem_bits = result[1]
+            for idx in problem_bits:
+                if idx not in to_expand:
+                    to_expand[idx] = set()
+                if not to_expand[idx].intersection(problem_bits[idx]):
+                    # No bits from this failure marked yet
+                    diff = problem_bits[idx].difference(to_expand[idx])
+                    to_expand[idx].update([min(diff)])  # note min()
+
+
+###########################################
+#            END OF LOOP
+###########################################
+
+
+
+######### Process our maximum compatible sets ############
+
+good = [i for i in range(len(results)) if results[i][0] == e_Success]
+
+# For speed, make a mapping from one set representation to another
+# (since most of these are the same between solutions).
+
+all_sets = set()
+for i in good:
+    all_sets.update([t for t in results[i][1]])
+mapping = {}
+for s in all_sets:
+    mapping[s] = ToOneOrTwoSets(s)
+
+scommon_unambig = set(i for i, t in enumerate(partially_disambig) if len(t[1]) == len(t[0]))
+
+consols = []
+disambig_stats = []
+for g in range(len(good)):
+
+    clique = results[good[g]][3]
+    disambig = results[good[g]][1]
+
+    witness_sets, set_singletons, set_unambig, forced = results[good[g]][2]
+
+    # Convert disambiguation results from C++ to the form we need
+
+    sets_disambig = list(sets_expanded)
+
+    for i in range(len(clique)):
+        sets_disambig[clique[i]] = mapping[disambig[i]]
+
+    clique_disambig = [i for i in clique
+                       if i in scommon_unambig
+                       or type(sets_disambig[i]) != tuple]
+    cannot_disambig = [i for i in clique
+                       if i not in scommon_unambig
+                       and type(sets_disambig[i]) == tuple]
+
+    # Numbers of patterns and columns with different disambiguation fates
+    ds = [(len(l), TotalWeight(l, weights_exp))
+          for l in (set_singletons, set_unambig, forced)]
+    disambig_stats.append(ds)
+
+    Print('Maximum clique %d:' % (g + 1))
+    Print('%d cols / %d patterns could not be disambiguated'
+          % (TotalWeight(cannot_disambig, weights_exp),
+             len(cannot_disambig)))
+    consol = ConsolidateCols(sets_disambig, clique_disambig, weights_exp)
+    consols.append(consol)
+
+
+# Make consensus
+
+big_consol = dict(consols[0])
+for c in consols[1:]:
+    for s in list(big_consol.keys()):
+        if s not in c:
+            # split must be in all solutions
+            del big_consol[s]       
+        else:
+            # count is min among solutions
+            big_consol[s] = min(big_consol[s], c[s])
+
+Print('Consensus tree length: %d' % sum(big_consol.values()))
+
+l = TreeFromCols(big_consol, nleaves)
+
+def MakeNewick(tr):
+    return _MakeNewick(tr) + ';'
+
+def _MakeNewick(tr):
+    if len(tr[2]) == 0:
+        # leaf node (base case)
+        i, = list(tr[0])  # should be exactly one in set
+        name = names[i]
+        return '%s:%d' % (name, tr[1])
+    # Non-leaf node; recurse
+    stuff = ', '.join([_MakeNewick(subtr) for subtr in tr[2]])
+    return '(%s):%d' % (stuff, tr[1])
+
+def Leaves(tr):
+    if len(tr[2]) == 0:
+        # leaf
+        if len(tr[0]) != 1:
+            raise RuntimeError('%s' % (tr,))
+        return [tr]
+    else:
+        # not leaf
+        return sum([Leaves(subtr) for subtr in tr[2]], [])
+
+
+
+# Build tree(s)
+
+tr = MakeNewick(l[0])
+
+fid = open(outfname, 'w')
+
+# Write the consensus tree
+fid.write(tr)
+fid.write('\n')
+
+if '--separate-trees' in optdict:
+    # One tree for every maximum compatible set
+    for consol in consols:
+        l = TreeFromCols(consol, nleaves)
+        tr = MakeNewick(l[0])
+        fid.write(tr)
+        fid.write('\n')
+
+fid.close()
+
+
+# Witness tree
+
+wconsol = ConsolidateCols(witness_sets,
+                          range(len(witness_sets)),
+                          [weights_exp[i] for i in clique])
+wl = TreeFromCols(wconsol, nleaves)
+wtr = MakeNewick(wl[0])
+
+if witness_fname != None:
+    fid = open(witness_fname, 'w')
+    fid.write(wtr)
+    fid.write('\n')
+    fid.close()
+
+#### End witness tree ###
+
+# Ambiguity resolution fates
+Print('Witnesses:')
+Print('  %.2f cols / %.2f patterns set to singletons' 
+      % (Mean([l[0][1] for l in disambig_stats]),
+         Mean([l[0][0] for l in disambig_stats])))
+Print('  %.2f cols / %.2f patterns set equal to unambiguous'
+      % (Mean([l[1][1] for l in disambig_stats]),
+         Mean([l[1][0] for l in disambig_stats])))
+Print('  %.2f cols / %.2f patterns resolved by forcing and disambiguating'
+      % (Mean([l[2][1] for l in disambig_stats]),
+         Mean([l[2][0] for l in disambig_stats])))
+
+
+# Summarize
+
+singleton_weight = sum([weights[i] for i, s in enumerate(sets)
+                        if len(s[0]) == 1 or len(s[1]) == len(seqs) - 1])
+informative_weight = sum(weights) - singleton_weight
+cols_in_clique = sum([weights_exp[i] for i in clique])
+cols_not_disambig = (sum([sum([t[1] for t in l]) for l in disambig_stats])
+                     / float(len(disambig_stats)))
+
+Print('')
+Print('%d maximum compatible sets' % len(good))
+Print('')
+Print('%d leaves' % len(seqs))
+Print('%d total columns in input' % len(cols))
+Print('\t%d columns with only 1 base' %
+      len([n for n in nucs
+           if len(n.intersection('AGCT')) == 1]))
+Print('\t%d columns with >2 bases' %
+      len([n for n in nucs
+           if len(n.intersection('AGCT')) > 2]))
+if max_ambig_frac < 1.0:
+    Print('\t%d columns with >%d ambiguities' %
+          (len(over_ambig), max_ambigs))
+Print('\t%d columns with exactly 2 bases (%d informative)'
+      % (sum(weights), informative_weight))
+Print('\t\t%d columns in maximum clique' % cols_in_clique)
+Print('\t\t\t%.2f columns could not be disambiguated (avg.)'
+      % cols_not_disambig)
+Print('\t\t\t%.2f columns used to make tree (avg.)'
+      % (cols_in_clique - cols_not_disambig))
+
+
+# Optionally write file listing positions with various dispostions
+
+if '--incompat-pos' in optdict:
+    # Column indices for of our legitimate max compatible sets:
+    included_poss = set(sum([poss_for_pat[orig_set_idx[j]]  # In all sets;
+                             for j in included], []))       # use to save time
+    mc_sets = [included_poss |
+               set(sum([poss_for_pat[orig_set_idx[j]]
+                        for j in results[i][3][len(included):]], []))
+               for i in good]
+
+    in_all = set(mc_sets[0])
+    in_any = set(mc_sets[0])
+    for s in mc_sets[1:]:
+        in_any.update(s)
+        in_all.intersection_update(s)
+
+    in_some = in_any.difference(in_all)
+    missing_all = set(poss).difference(in_any)
+    gt_two_bases = [i for i in range(len(nucs))     # poss with >2 bases
+                    if len(nucs[i].intersection('AGCT')) > 2]
+
+    fid = open(optdict['--incompat-pos'], 'w')
+
+    for i in sorted(missing_all):
+        fid.write('%d\tincompatible_all_trees\n' % (i + 1))  # 1-based coordinates
+
+    for i in sorted(in_some):
+        fid.write('%d\tincompatible_some_trees\n' % (i + 1))
+
+    for i in sorted(gt_two_bases):
+        fid.write('%d\tmore_than_two_nucleotides\n' % (i + 1))
+
+    fid.close()
+
+
+# Faster exit (skip garbage collection), unless we're profiling or used -i
+if sys.getprofile() is None and not sys.flags.interactive:
+    sys.stdout.flush()
+    sys.stderr.flush()
+    import os
+    os._exit(0)

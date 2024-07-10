@@ -1,0 +1,3 @@
+include compat.hpp
+recursive-include examples
+

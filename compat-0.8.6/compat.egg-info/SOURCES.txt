@@ -1,0 +1,13 @@
+MANIFEST.in
+README
+compat
+compat.cpp
+compat.hpp
+compat.py
+compat_wrap.cpp
+setup.cfg
+setup.py
+compat.egg-info/PKG-INFO
+compat.egg-info/SOURCES.txt
+compat.egg-info/dependency_links.txt
+compat.egg-info/top_level.txt
