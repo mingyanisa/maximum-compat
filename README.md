@@ -11,7 +11,8 @@ module load python
 conda activate ${ENV_NAME}
 conda install conda-forge/label/h6f9ffa1_0::gcc setuptools
 cd compat-0.8.6
-pip3 install -e .
+python3 ./setup.py build
+python3 ./setup.py install
 ```
 ## Running the script on codon-slurm
 ```
