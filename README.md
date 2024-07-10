@@ -5,10 +5,11 @@ Maximum Compatability
 ## Installing packages
 ```
 source /hps/software/opt/linux-rocky8-cascadelake/anaconda3/etc/profile.d/conda.sh
+module load python 
 
 # conda create -n ${ENV_NAME}
 conda activate ${ENV_NAME}
-conda install conda-forge/label/h6f9ffa1_0::gcc
+conda install conda-forge/label/h6f9ffa1_0::gcc setuptools
 cd compat-0.8.6
 pip3 install -e .
 ```

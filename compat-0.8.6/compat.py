@@ -12,18 +12,19 @@ from sys import version_info
 if version_info >= (2,6,0):
     def swig_import_helper():
         from os.path import dirname
-        import imp
+        import importlib.util
         fp = None
         try:
-            fp, pathname, description = imp.find_module('_compat', [dirname(__file__)])
+            # print(importlib.util.find_spec('_compat', [dirname(__file__)]))
+            fp = importlib.util.find_spec('_compat', [dirname(__file__)])
         except ImportError:
             import _compat
             return _compat
         if fp is not None:
-            try:
-                _mod = imp.load_module('_compat', fp, pathname, description)
-            finally:
-                fp.close()
+            # try:
+            _mod = fp.loader.load_module('_compat')
+            # finally:
+            #     _mod.close()
             return _mod
     _compat = swig_import_helper()
     del swig_import_helper
