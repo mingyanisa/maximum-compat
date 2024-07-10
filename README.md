@@ -2,6 +2,8 @@ Maximum Compatability
 ===
 ## Input data 
 - Salmonella data in the folder `clusters`
+## Output data 
+- Generated maximum compatability tree for Salmonella data in the folder `results`
 ## Installing packages
 ```
 source /hps/software/opt/linux-rocky8-cascadelake/anaconda3/etc/profile.d/conda.sh
