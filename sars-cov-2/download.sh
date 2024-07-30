@@ -1,7 +1,7 @@
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 # Define the TSV file path (modify as needed)
-tsv_file="$DIR/dataset.tsv"
+tsv_file="$DIR/cleaned_dataset.tsv"
 
 # Check if the file exists
 if [ ! -f "$tsv_file" ]; then
@@ -16,7 +16,7 @@ while IFS=$'\t' read -r GISAID_assession lineage srArun_acc biosample_acc ftpRea
     if [[ "$srArun_acc" == "SRArun_acc" || "$srArun_acc" == 'NA' ]]; then
         continue
     fi
-    if [[ -f "$DIR/reads/${srArun_acc}_2.fastq.gz" ]]; then
+    if [[ -f "$DIR/reads/${srArun_acc}_1.fastq.gz" || -f "$DIR/reads/${srArun_acc}_2.fastq.gz" ]]; then
         echo "File '$srArun_acc' already exists, skipping..."
     else
         # Print the extracted SRArun_acc

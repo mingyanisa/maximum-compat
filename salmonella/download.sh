@@ -1,7 +1,7 @@
 
 DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
 # Define the TSV file path (modify as needed)
-tsv_file="$DIR/dataset.tsv"
+tsv_file="$DIR/cleaned_dataset.tsv"
 
 # Check if the file exists
 if [ ! -f "$tsv_file" ]; then
@@ -16,16 +16,16 @@ while IFS=$'\t' read -r biosample_acc strain genBankAssembly SRArun_acc ftpRead1
     if [[ "$srArun_acc" == "SRArun_acc" || "$srArun_acc" == 'NA' ]]; then
         continue
     fi
-    if [[ -f "$DIR/reads/${srArun_acc}_2.fastq.gz" ]]; then
-        echo "File '$srArun_acc' already exists, skipping..."
-    else
-        # Print the extracted SRArun_acc
+    # if [[ -f "$DIR/reads/${srArun_acc}_1.fastq.gz" || -f "$DIR/reads/${srArun_acc}_2.fastq.gz" ]]; then
+    #     echo "File '$srArun_acc' already exists, skipping..."
+    # else
+    #     # Print the extracted SRArun_acc
        
-        # echo "$ftpRead1" "$ftpRead2"
-        wget -t 0 -O $DIR/reads/${srArun_acc}_1.fastq.gz ${ftpRead1}
-        wget -t 0 -O $DIR/reads/${srArun_acc}_2.fastq.gz ${ftpRead2}
-        # Add error handling for wget if needed
-    fi
+    #     # echo "$ftpRead1" "$ftpRead2"
+    #     wget -t 0 -O $DIR/reads/${srArun_acc}_1.fastq.gz ${ftpRead1}
+    #     wget -t 0 -O $DIR/reads/${srArun_acc}_2.fastq.gz ${ftpRead2}
+    #     # Add error handling for wget if needed
+    # fi
 
 done < "$tsv_file"
 # < <(tail -n +2 "$tsv_file")
